@@ -684,6 +684,9 @@ function route() {
   else viewToday();
   renderDock();
 }
+// Auto-save sync fields as you type so nothing is lost if the page is closed before tapping Save.
+document.addEventListener('input', (e) => { const id = e.target && e.target.id; if (id === 'y-url' || id === 'y-tok' || id === 'y-auto') { S.syncUrl = $('#y-url').value.trim(); S.syncToken = $('#y-tok').value.trim(); S.autoSync = $('#y-auto').checked; St.saveSettings(); } });
+document.addEventListener('change', (e) => { const id = e.target && e.target.id; if (id === 'y-url' || id === 'y-tok' || id === 'y-auto') { S.syncUrl = $('#y-url').value.trim(); S.syncToken = $('#y-tok').value.trim(); S.autoSync = $('#y-auto').checked; St.saveSettings(); } });
 window.addEventListener('hashchange', route);
 $('#gear').addEventListener('click', () => { location.hash = '#/data'; });
 St.onChange((what) => { const dot = $('#syncdot'); if (what === 'status') { dot.className = 'dot ' + St.status; } else if (what === 'data') route(); });
