@@ -89,6 +89,171 @@
       if (take) { m.set(r.id, r); changed++; } });
     return { list: Array.from(m.values()), changed };
   }
-  const api = { num, r1, round5, linreg, loadAtV, mvAtLoad, VELS, loadsTable, vlPct, e1rm, firstNum, topNum, readiness, COLUMNS, BODY_COLUMNS, toCSV, parseCSV, sessionRows, bodyRow, mergeRecords };
+  // Suggest a working load from prior sessions of one lift.
+  // sessions: [{ date, ts?, week?, deload?, sets: [{ load, reps?, dist?, done? }] }] (done sets; undone ignored)
+  // scheme:   { sets, reps }  reps may be a number or a range like "6-8" (the top of the range is the target)
+  // opts:     { bw, isDeload(session) }
+  // Returns { load, basis, confidence, rough } or null. confidence is "high" | "medium" | "low".
+  //
+  // Rules:
+  // - Bodyweight exercises and sessions with no positive load return null.
+  // - Deload sessions (session.deload, opts.isDeload, or week % 4 === 0) are dropped so a light week cannot pull the suggestion down.
+  // - Exact scheme (same reps, set count within 1) repeats that session's load. The winning session is the best score, not an average.
+  // - A different rep count is converted with Epley — e1RM = load * (1 + reps/30) — inverted at the target reps, then rounded to the nearest 5 lb.
+  // - Targets above 8 reps are discounted 1.5% per extra rep (cap 10%) because rep-max formulas run hot there. Exact repeats are not discounted.
+  // - Score = 0.5^age * 0.55^|rep difference| * 0.6^|set difference| (age 0 = newest usable session). Closer reps can outrank a newer but dissimilar session.
+  // - When no exact scheme exists, scored sessions are combined as a weighted average of their converted loads.
+  // - A single outlier (one session more than 12% and at least 15 lb from the median, with two or more sessions that agree) is clamped to that band so it cannot swing the result.
+  const SUGGEST_RECENCY = 0.5, SUGGEST_REP = 0.55, SUGGEST_SET = 0.6;
+  const SUGGEST_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function suggestMedian(nums) {
+    const a = nums.slice().sort((x, y) => x - y); if (!a.length) return null;
+    const m = Math.floor(a.length / 2);
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  }
+  function suggestFmtLoad(n) {
+    if (n == null || isNaN(n)) return '';
+    if (Math.abs(n - Math.round(n)) < 1e-6) return String(Math.round(n));
+    return String(Math.round(n * 10) / 10);
+  }
+  function suggestShortDate(date) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(date || ''));
+    if (!m) return '';
+    return SUGGEST_MONTHS[+m[2] - 1] + ' ' + (+m[3]);
+  }
+  function suggestIsDeload(s, opts) {
+    if (!s) return false;
+    if (s.deload) return true;
+    if (opts && typeof opts.isDeload === 'function') return !!opts.isDeload(s);
+    return s.week != null && s.week % 4 === 0;
+  }
+  function suggestReps(v) {
+    if (v == null || v === '') return null;
+    const n = typeof v === 'number' ? v : parseFloat(v);
+    return n > 0 && !isNaN(n) ? Math.round(n) : null;
+  }
+  function suggestSummarize(sets, targetReps) {
+    const usable = (sets || []).filter((s) => s && s.done !== false && typeof s.load === 'number' && s.load > 0 && !isNaN(s.load));
+    if (!usable.length) return null;
+    const parsed = usable.map((s) => ({ load: s.load, reps: suggestReps(s.reps), dist: (typeof s.dist === 'number' && s.dist > 0 ? s.dist : null) }));
+    const withReps = parsed.filter((s) => s.reps != null);
+    let cluster;
+    if (targetReps != null && withReps.length) {
+      let bestD = Infinity;
+      withReps.forEach((s) => { const d = Math.abs(s.reps - targetReps); if (d < bestD) bestD = d; });
+      const counts = new Map();
+      withReps.forEach((s) => { if (Math.abs(s.reps - targetReps) === bestD) counts.set(s.reps, (counts.get(s.reps) || 0) + 1); });
+      let pick = null, pickN = -1;
+      counts.forEach((n, r) => { if (n > pickN || (n === pickN && r < pick)) { pick = r; pickN = n; } });
+      cluster = withReps.filter((s) => s.reps === pick);
+    } else cluster = parsed;
+    const loads = cluster.map((s) => s.load);
+    const dists = cluster.map((s) => s.dist).filter((d) => d != null);
+    const reps = cluster[0].reps != null && cluster.every((s) => s.reps === cluster[0].reps) ? cluster[0].reps : null;
+    return { load: suggestMedian(loads), uniform: loads.every((l) => l === loads[0]), rawLoad: loads[0], reps, nSets: cluster.length, dist: dists.length ? suggestMedian(dists) : null };
+  }
+  // Epley invert. Discount only when the TARGET is above 8 and the reps actually changed.
+  function suggestEq(sum, targetReps) {
+    if (sum.reps == null || targetReps == null || sum.reps === targetReps) return sum.load;
+    const e = e1rm(sum.load, sum.reps); if (e == null) return sum.load;
+    let out = e / (1 + targetReps / 30);
+    if (targetReps > 8) out *= 1 - Math.min(0.10, 0.015 * (targetReps - 8));
+    return out;
+  }
+  function suggestScore(sum, age, targetReps, targetSets) {
+    let w = Math.pow(SUGGEST_RECENCY, age);
+    if (targetReps != null && sum.reps != null) w *= Math.pow(SUGGEST_REP, Math.abs(sum.reps - targetReps));
+    if (targetSets != null) w *= Math.pow(SUGGEST_SET, Math.abs(sum.nSets - targetSets));
+    return w;
+  }
+  function suggestCap(items) {
+    const out = items.map((it) => Object.assign({}, it, { eqUse: it.eq, capped: false }));
+    if (out.length < 3) return out;
+    const med = suggestMedian(out.map((it) => it.eq));
+    const band = Math.max(15, Math.abs(med) * 0.12);
+    const idx = [];
+    out.forEach((it, i) => { if (Math.abs(it.eq - med) > band) idx.push(i); });
+    if (idx.length !== 1 || out.length - idx.length < 2) return out;
+    const rest = out.filter((_, i) => i !== idx[0]);
+    let tw = 0, s = 0; rest.forEach((it) => { tw += it.w; s += it.w * it.eq; });
+    const avg = tw ? s / tw : med;
+    const b2 = Math.max(15, Math.abs(avg) * 0.12);
+    const it = out[idx[0]];
+    const clamped = Math.min(avg + b2, Math.max(avg - b2, it.eq));
+    if (Math.abs(clamped - it.eq) > 0.01) { it.eqUse = clamped; it.capped = true; }
+    return out;
+  }
+  function suggestWeighted(items) {
+    let tw = 0, s = 0;
+    items.forEach((it) => { tw += it.w; s += it.w * it.eqUse; });
+    return tw ? s / tw : null;
+  }
+  function suggestLoad(sessions, scheme, opts) {
+    opts = opts || {}; scheme = scheme || {};
+    if (opts.bw) return null;
+    if (!Array.isArray(sessions) || !sessions.length) return null;
+    const targetReps = (scheme.reps == null || scheme.reps === '' || /max/i.test(String(scheme.reps))) ? null : topNum(scheme.reps);
+    const rawReps = scheme.reps == null ? '' : String(scheme.reps).replace(/\s+/g, '');
+    const repsLabel = targetReps != null && rawReps && rawReps !== String(targetReps) ? rawReps : (targetReps != null ? String(targetReps) : null);
+    const targetSets = scheme.sets != null && scheme.sets !== '' ? Number(scheme.sets) : null;
+    const rows = sessions.filter((s) => s && !suggestIsDeload(s, opts));
+    if (!rows.length) return null;
+    rows.sort((a, b) => {
+      const ka = String(a.date || '') + String(a.ts || 0).padStart(15, '0');
+      const kb = String(b.date || '') + String(b.ts || 0).padStart(15, '0');
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    const prepared = [];
+    rows.forEach((s) => {
+      const sum = suggestSummarize(s.sets, targetReps);
+      // A rep target needs logged reps. Load-only history (carries, missed reps) cannot drive an e1RM conversion.
+      if (!sum) return;
+      if (targetReps != null && sum.reps == null) return;
+      prepared.push({ s, sum });
+    });
+    const n = prepared.length; if (!n) return null;
+    prepared.forEach((it, i) => {
+      const age = n - 1 - i;
+      it.eq = suggestEq(it.sum, targetReps);
+      it.w = suggestScore(it.sum, age, targetReps, targetSets);
+      it.idx = i;
+    });
+    const loadOnly = targetReps == null;
+    const exact = prepared.filter((it) => (loadOnly || it.sum.reps === targetReps) && (targetSets == null || Math.abs(it.sum.nSets - targetSets) <= 1));
+    const useExact = exact.length > 0 && (loadOnly || exact.some((it) => it.sum.reps === targetReps));
+    const pool = suggestCap(useExact ? exact : prepared);
+    let best = pool[0];
+    pool.forEach((it) => { if (it.w > best.w + 1e-12 || (Math.abs(it.w - best.w) <= 1e-12 && it.idx > best.idx)) best = it; });
+    let load, blended = false;
+    if (useExact) {
+      if (best.capped) load = round5(best.eqUse);
+      else if (best.sum.uniform) load = best.sum.rawLoad;
+      else load = round5(best.sum.load);
+    } else {
+      const mean = suggestWeighted(pool);
+      load = round5(mean);
+      const anchor = round5(best.capped ? best.eqUse : best.eq);
+      blended = anchor != null && load != null && load !== anchor;
+    }
+    if (load == null || isNaN(load) || load <= 0) return null;
+    const dRep = (best.sum.reps == null || targetReps == null) ? 0 : Math.abs(best.sum.reps - targetReps);
+    const dSet = targetSets == null ? 0 : Math.abs(best.sum.nSets - targetSets);
+    const cited = best.sum.uniform ? best.sum.rawLoad : best.sum.load;
+    const when = suggestShortDate(best.s.date);
+    let basis;
+    if (best.sum.reps != null) basis = best.sum.nSets + 'x' + best.sum.reps + ' at ' + suggestFmtLoad(cited) + (when ? ' on ' + when : '');
+    else if (best.sum.dist) basis = best.sum.nSets + 'x' + suggestFmtLoad(best.sum.dist) + ' m at ' + suggestFmtLoad(cited) + (when ? ' on ' + when : '');
+    else basis = best.sum.nSets + (best.sum.nSets === 1 ? ' set' : ' sets') + ' at ' + suggestFmtLoad(cited) + ' lb' + (when ? ' on ' + when : '');
+    if (dRep > 0) basis += ', adjusted for ' + (targetSets != null ? targetSets : best.sum.nSets) + 'x' + repsLabel;
+    if (best.capped) basis += ' \u00B7 capped';
+    else if (blended) basis += ' \u00B7 blended';
+    const rough = dRep >= 4;
+    let confidence = 'medium';
+    if (best.capped || rough) confidence = 'low';
+    else if (dRep === 0 && dSet <= 1) confidence = 'high';
+    return { load, basis, confidence, rough };
+  }
+
+  const api = { num, r1, round5, linreg, loadAtV, mvAtLoad, VELS, loadsTable, vlPct, e1rm, firstNum, topNum, readiness, COLUMNS, BODY_COLUMNS, toCSV, parseCSV, sessionRows, bodyRow, mergeRecords, suggestLoad };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.Calc = api;
 })(typeof self !== 'undefined' ? self : this);

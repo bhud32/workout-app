@@ -66,7 +66,7 @@ function buildHist() {
       if (!sets.length && !ramp.length) return;
       const arr = (h[ex.lift] = h[ex.lift] || []); const ex0 = arr.find((x) => x.sid === s.id);
       if (ex0) { ex0.sets = ex0.sets.concat(sets); ex0.ramp = ex0.ramp.concat(ramp); if (ex.kind === 'reps' && ex0.ex.kind !== 'reps') { ex0.ex = ex; ex0.exid = ex.id; } }
-      else arr.push({ sid: s.id, date: s.date, ts: s.startedAt || 0, sets, ramp, exid: ex.id, ex }); }); });
+      else arr.push({ sid: s.id, date: s.date, ts: s.startedAt || 0, week: s.week, deload: Prog.isDeload(s.week), sets, ramp, exid: ex.id, ex }); }); });
   Object.values(h).forEach((a) => a.sort((x, y) => (x.date + String(x.ts).padStart(15, '0')) < (y.date + String(y.ts).padStart(15, '0')) ? -1 : 1));
   return h;
 }
@@ -97,14 +97,35 @@ function loadHint(ex, s, hist) { // numeric load suggestion text + {lo,hi}
   if (ex.profile && ex.wkSpec && ex.wkSpec.segs) { /* top/back-off sets without numeric band for floor press: no hint */ }
   return null;
 }
+function schemeFor(ex, i) {
+  const specs = ex.setSpecs || []; const spec = specs[i] || specs[0] || {};
+  const reps = spec.reps != null ? spec.reps : null; const label = spec.label || '';
+  let sets = specs.filter((sp) => (sp.label || '') === label && String(sp.reps) === String(reps)).length;
+  if (!sets) sets = specs.length || 1;
+  return { sets, reps };
+}
+function suggestFor(ex, i, hist, sid) {
+  if (!ex || ex.bw || !ex.lift || !fieldsFor(ex).includes('load')) return null;
+  const prior = (hist[ex.lift] || []).filter((h) => h.sid !== sid);
+  if (!prior.length) return null;
+  const scheme = schemeFor(ex, i);
+  // Epley is for rep work. Carries and jumps log a load, but their "reps" are meters or attempts.
+  if (ex.kind !== 'reps' && ex.kind !== 'interval') scheme.reps = null;
+  return C.suggestLoad(prior, scheme, { bw: !!ex.bw, isDeload: (h) => !!(h.deload || Prog.isDeload(h.week)) });
+}
 function prefill(s, ex, i, hist) {
   const out = {}; const d = s.ex[ex.id]; const f = fieldsFor(ex);
   const prev = d && d.sets ? d.sets.slice(0, i).reverse().find((x) => x && x.done) : null;
   const last = lastOf(hist, ex.lift, s.id); const ls = last ? (last.sets[i] || last.sets[last.sets.length - 1]) : null;
   const src = prev || ls;
-  if (src) { ['load', 'metric', 'dist'].forEach((k) => { if (src[k] != null) out[k] = src[k]; }); if (ex.kind === 'timed' && src.secs != null && !prev) out.secs = src.secs; }
-  if (out.load == null && f.includes('load') && ex.load0) out.load = ex.load0;
-  if (out.load == null && f.includes('load')) { const lh = loadHint(ex, s, hist); if (lh) out.load = Math.round((lh.lo + lh.hi) / 2 / 5) * 5; }
+  if (src) { ['metric', 'dist'].forEach((k) => { if (src[k] != null) out[k] = src[k]; }); if (ex.kind === 'timed' && src.secs != null && !prev) out.secs = src.secs; }
+  if (f.includes('load')) {
+    // A set already logged this session keeps its load on the sets after it. Otherwise use history, then the old fallbacks.
+    if (prev && prev.load != null) out.load = prev.load;
+    else { const sug = suggestFor(ex, i, hist, s.id); if (sug) out.load = sug.load; }
+    if (out.load == null && ex.load0) out.load = ex.load0;
+    if (out.load == null) { const lh = loadHint(ex, s, hist); if (lh) out.load = Math.round((lh.lo + lh.hi) / 2 / 5) * 5; }
+  }
   const sp = ex.setSpecs[i] || {};
   const top = C.topNum(sp.reps);
   if (f.includes('reps') && top != null) out.reps = prev && prev.reps != null && ex.kind === 'reps' && !/-/.test(String(sp.reps)) ? top : top;
@@ -244,8 +265,10 @@ function exInfoHTML(ex, label, s, hist) {
   if (last && last.sets.length) { const top = last.sets.slice().sort((a, b) => (b.load || 0) - (a.load || 0) || (b.reps || 0) - (a.reps || 0))[0];
     const bits = []; if (top.load) bits.push(top.load + (ex.bw ? ' lb added' : ' lb')); if (top.reps != null && ex.kind !== 'timed') bits.push('\u00D7' + top.reps); if (top.secs) bits.push(top.secs + ' s'); if (top.metric) bits.push(top.metric + ' ' + unitOf(ex)); if (top.dist) bits.push(top.dist + ' m'); if (top.mv1) bits.push('@' + top.mv1.toFixed(2) + ' m/s');
     lastTxt = 'Last (' + fmtDate(last.date) + '): ' + bits.join(' '); }
+  const sug = suggestFor(ex, 0, hist, s.id);
+  const sugTxt = sug ? 'Suggest ' + sug.load + ' lb: ' + sug.basis + (sug.rough ? ' \u00B7 rough estimate' : '') : '';
   const sp = ex.setSpecs[0] || {}; const notes = [ex.wkSpec && ex.wkSpec.note].filter(Boolean);
-  return '<h3>' + (label ? '<span class="badge i">' + label + '</span> ' : '') + esc(ex.name) + (ex.optional ? ' <span class="badge">optional</span>' : '') + '</h3><div class="meta">' + esc(metaOf(ex)) + '</div>' + (lastTxt ? '<div class="hint" style="color:var(--mut)">' + esc(lastTxt) + '</div>' : '') + (lh ? '<div class="hint">' + esc(lh.txt) + '</div>' : '') + (notes.length ? '<div class="hint">' + esc(notes.join(' ')) + '</div>' : '') + (ex.cue ? '<details class="cue"><summary>Cues</summary>' + esc(ex.cue) + '</details>' : '');
+  return '<h3>' + (label ? '<span class="badge i">' + label + '</span> ' : '') + esc(ex.name) + (ex.optional ? ' <span class="badge">optional</span>' : '') + '</h3><div class="meta">' + esc(metaOf(ex)) + '</div>' + (lastTxt ? '<div class="hint" style="color:var(--mut)">' + esc(lastTxt) + '</div>' : '') + (sugTxt ? '<div class="hint">' + esc(sugTxt) + '</div>' : '') + (lh ? '<div class="hint">' + esc(lh.txt) + '</div>' : '') + (notes.length ? '<div class="hint">' + esc(notes.join(' ')) + '</div>' : '') + (ex.cue ? '<details class="cue"><summary>Cues</summary>' + esc(ex.cue) + '</details>' : '');
 }
 function checkHTML(s, ex) {
   const d = exData(s, ex); const done = d.sets[0].done;
